@@ -3,12 +3,13 @@ import {
   streamChatCompletion,
   getChatCompletion,
   getGeminiClient,
+  fetchGoogleModels,
 } from '../gemini.js';
 
 const router = Router();
 
-// Available Gemini models configuration
-const SUPPORTED_MODELS = [
+// Default supported models configuration
+const DEFAULT_MODELS = [
   {
     id: 'gemini-1.5-flash',
     name: 'Gemini 1.5 Flash',
@@ -17,28 +18,31 @@ const SUPPORTED_MODELS = [
     description: 'High speed, balanced intelligence, and low latency for everyday tasks.',
   },
   {
+    id: 'gemini-2.0-flash',
+    name: 'Gemini 2.0 Flash',
+    tag: 'Next-Gen Speed',
+    recommended: false,
+    description: 'Next-generation Gemini model with ultra-fast generation and low latency.',
+  },
+  {
     id: 'gemini-1.5-pro',
     name: 'Gemini 1.5 Pro',
     tag: 'Complex Reasoning',
     recommended: false,
     description: 'Highest capability for complex reasoning, multi-step code, and math.',
   },
-  {
-    id: 'gemini-2.0-flash-exp',
-    name: 'Gemini 2.0 Flash (Exp)',
-    tag: 'Next-Gen Speed',
-    recommended: false,
-    description: 'Next-generation multimodal model with state-of-the-art response speed.',
-  },
 ];
 
 /**
  * GET /api/models
- * Returns the list of supported Gemini models
+ * Returns the list of supported Gemini models (dynamic if key available)
  */
-router.get('/models', (req, res) => {
+router.get('/models', async (req, res) => {
+  const customApiKey = req.headers['x-gemini-api-key'] || null;
+  const dynamicModels = await fetchGoogleModels(customApiKey);
+
   res.json({
-    models: SUPPORTED_MODELS,
+    models: dynamicModels && dynamicModels.length > 0 ? dynamicModels : DEFAULT_MODELS,
     defaultModel: process.env.DEFAULT_MODEL || 'gemini-1.5-flash',
   });
 });

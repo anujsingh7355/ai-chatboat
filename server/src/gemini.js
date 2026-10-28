@@ -12,8 +12,18 @@ Your responses should be:
 - When answering complex technical or mathematical questions, provide step-by-step explanations.`;
 
 /**
+ * Candidate models to try in fallback order if one is unavailable
+ */
+export const FALLBACK_MODELS = [
+  'gemini-2.0-flash',
+  'gemini-1.5-flash',
+  'gemini-1.5-flash-latest',
+  'gemini-1.5-pro',
+  'gemini-pro',
+];
+
+/**
  * Initialize Google Generative AI client
- * Uses environment variable GEMINI_API_KEY or key passed dynamically
  */
 export function getGeminiClient(customApiKey = null) {
   const apiKey = customApiKey || process.env.GEMINI_API_KEY;
@@ -28,7 +38,6 @@ export function getGeminiClient(customApiKey = null) {
 
 /**
  * Formats chat message history for the Gemini SDK
- * Expects array of { role: 'user' | 'assistant' | 'model', content: string }
  */
 export function formatChatHistory(messages = []) {
   return messages.map((msg) => {
@@ -41,7 +50,40 @@ export function formatChatHistory(messages = []) {
 }
 
 /**
- * Stream chat completion from Gemini
+ * Fetches available models directly from Google Generative Language API
+ */
+export async function fetchGoogleModels(customApiKey = null) {
+  const apiKey = customApiKey || process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey.trim() === '' || apiKey === 'your_gemini_api_key_here') {
+    return null;
+  }
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey.trim()}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.models) return null;
+
+    // Filter models that support content generation
+    return data.models
+      .filter((m) => m.supportedGenerationMethods?.includes('generateContent'))
+      .map((m) => {
+        const id = m.name.replace(/^models\//, '');
+        return {
+          id,
+          name: m.displayName || id,
+          description: m.description || '',
+          recommended: id.includes('flash'),
+        };
+      });
+  } catch (err) {
+    console.warn('Failed to fetch dynamic models from Google API:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Stream chat completion from Gemini with automatic model fallback
  */
 export async function* streamChatCompletion({
   messages,
@@ -51,18 +93,12 @@ export async function* streamChatCompletion({
 }) {
   const genAI = getGeminiClient(customApiKey);
 
-  // Validate model name fallback
-  const validModel = model && model.trim() ? model.trim() : 'gemini-1.5-flash';
+  // Build candidate models order
+  const candidates = Array.from(new Set([
+    model,
+    ...FALLBACK_MODELS,
+  ].filter(Boolean)));
 
-  const generativeModel = genAI.getGenerativeModel({
-    model: validModel,
-    systemInstruction: SYSTEM_INSTRUCTION,
-    generationConfig: {
-      temperature,
-    },
-  });
-
-  // Separate conversation history from current message
   const history = formatChatHistory(messages.slice(0, -1));
   const latestMessage = messages[messages.length - 1];
 
@@ -70,23 +106,47 @@ export async function* streamChatCompletion({
     throw new Error('Latest message is required');
   }
 
-  // Create chat session with previous messages
-  const chat = generativeModel.startChat({
-    history,
-  });
+  let lastError = null;
 
-  try {
-    const resultStream = await chat.sendMessageStream(latestMessage.content);
+  for (const candidateModel of candidates) {
+    try {
+      console.log(`[Gemini] Attempting generation with model: "${candidateModel}"...`);
 
-    for await (const chunk of resultStream.stream) {
-      const text = chunk.text();
-      if (text) {
-        yield text;
+      const generativeModel = genAI.getGenerativeModel({
+        model: candidateModel,
+        systemInstruction: SYSTEM_INSTRUCTION,
+        generationConfig: { temperature },
+      });
+
+      const chat = generativeModel.startChat({ history });
+      const resultStream = await chat.sendMessageStream(latestMessage.content);
+
+      for await (const chunk of resultStream.stream) {
+        const text = chunk.text();
+        if (text) {
+          yield text;
+        }
       }
+
+      // Success! Exit candidate loop
+      return;
+    } catch (err) {
+      console.warn(`[Gemini] Model "${candidateModel}" failed: ${err.message}`);
+      lastError = err;
+
+      // If error is 404 / model not found, try next candidate model
+      const isNotFound = err.message?.includes('not found') || err.status === 404 || err.message?.includes('models/');
+      if (isNotFound) {
+        continue;
+      }
+
+      // For auth or quota errors, don't keep retrying other models
+      throw parseGeminiError(err, candidateModel);
     }
-  } catch (err) {
-    throw parseGeminiError(err);
   }
+
+  // If all candidate models failed
+  throw parseGeminiError(lastError, model);
 }
 
 /**
@@ -99,15 +159,11 @@ export async function getChatCompletion({
   temperature = 0.7,
 }) {
   const genAI = getGeminiClient(customApiKey);
-  const validModel = model && model.trim() ? model.trim() : 'gemini-1.5-flash';
 
-  const generativeModel = genAI.getGenerativeModel({
-    model: validModel,
-    systemInstruction: SYSTEM_INSTRUCTION,
-    generationConfig: {
-      temperature,
-    },
-  });
+  const candidates = Array.from(new Set([
+    model,
+    ...FALLBACK_MODELS,
+  ].filter(Boolean)));
 
   const history = formatChatHistory(messages.slice(0, -1));
   const latestMessage = messages[messages.length - 1];
@@ -116,20 +172,36 @@ export async function getChatCompletion({
     throw new Error('Latest message is required');
   }
 
-  const chat = generativeModel.startChat({ history });
+  let lastError = null;
 
-  try {
-    const result = await chat.sendMessage(latestMessage.content);
-    return result.response.text();
-  } catch (err) {
-    throw parseGeminiError(err);
+  for (const candidateModel of candidates) {
+    try {
+      const generativeModel = genAI.getGenerativeModel({
+        model: candidateModel,
+        systemInstruction: SYSTEM_INSTRUCTION,
+        generationConfig: { temperature },
+      });
+
+      const chat = generativeModel.startChat({ history });
+      const result = await chat.sendMessage(latestMessage.content);
+      return result.response.text();
+    } catch (err) {
+      lastError = err;
+      const isNotFound = err.message?.includes('not found') || err.status === 404 || err.message?.includes('models/');
+      if (isNotFound) {
+        continue;
+      }
+      throw parseGeminiError(err, candidateModel);
+    }
   }
+
+  throw parseGeminiError(lastError, model);
 }
 
 /**
  * Translates low-level SDK errors into user-friendly diagnostic messages
  */
-export function parseGeminiError(error) {
+export function parseGeminiError(error, attemptedModel = '') {
   const message = error.message || '';
 
   if (message.includes('API_KEY_INVALID') || message.includes('API key not valid')) {
@@ -154,7 +226,7 @@ export function parseGeminiError(error) {
   }
 
   if (message.includes('models/') && message.includes('not found')) {
-    const err = new Error(`The requested model is not available or unsupported for this API key. Try switching to 'gemini-1.5-flash'.`);
+    const err = new Error(`Model "${attemptedModel || 'gemini-1.5-flash'}" is currently unavailable for this API key. Detail: ${message}`);
     err.status = 404;
     err.code = 'MODEL_NOT_FOUND';
     return err;
